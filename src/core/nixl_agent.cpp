@@ -56,6 +56,7 @@ std::string nixlEnumStrings::xferOpStr (const nixl_xfer_op_t &op) {
 std::string
 nixlEnumStrings::statusStr(const nixl_status_t &status) {
     switch (status) {
+        case NIXL_SENT:                  return "NIXL_SENT";
         case NIXL_IN_PROG:               return "NIXL_IN_PROG";
         case NIXL_SUCCESS:               return "NIXL_SUCCESS";
         case NIXL_ERR_NOT_POSTED:        return "NIXL_ERR_NOT_POSTED";
@@ -1055,11 +1056,11 @@ nixlAgent::postXferReq(nixlXferReqH *req_hndl,
         return NIXL_ERR_NOT_FOUND;
     }
 
-    // We can't repost while a request is in progress
-    if (req_hndl->status == NIXL_IN_PROG) {
+    // We can't repost while a request is in progress (or sent but not yet done)
+    if (req_hndl->status == NIXL_IN_PROG || req_hndl->status == NIXL_SENT) {
         req_hndl->status = req_hndl->engine->checkXfer(
                                      req_hndl->backendHandle);
-        if (req_hndl->status == NIXL_IN_PROG) {
+        if (req_hndl->status == NIXL_IN_PROG || req_hndl->status == NIXL_SENT) {
             NIXL_ERROR_FUNC << "transfer request is still in progress and cannot be reposted";
             return NIXL_ERR_REPOST_ACTIVE;
         }
@@ -1124,7 +1125,8 @@ nixlAgent::postXferReq(nixlXferReqH *req_hndl,
 
         if (req_hndl->status < 0) {
             data->addErrorTelemetry(req_hndl->status);
-        } else if (req_hndl->status == NIXL_IN_PROG) {
+        } else if (req_hndl->status == NIXL_IN_PROG ||
+                   req_hndl->status == NIXL_SENT) {
             req_hndl->updateRequestStats(data->telemetry_, NIXL_TELEMETRY_POST);
         } else {
             req_hndl->updateRequestStats(data->telemetry_, NIXL_TELEMETRY_POST_AND_FINISH);
@@ -1140,7 +1142,8 @@ nixlAgent::getXferStatus (nixlXferReqH *req_hndl) const {
     NIXL_SHARED_LOCK_GUARD(data->lock);
     // If the status is done, no need to recheck and no state changes.
     // Same for users incorrectly recalling this method in error/done.
-    if (req_hndl->status == NIXL_IN_PROG) {
+    // Re-check if status is IN_PROG or SENT (flush still pending).
+    if (req_hndl->status == NIXL_IN_PROG || req_hndl->status == NIXL_SENT) {
         // Check if the remote was invalidated before completion
         if (data->remoteSections.count(req_hndl->remoteAgent) == 0) {
             NIXL_ERROR_FUNC << "remote agent '" << req_hndl->remoteAgent
@@ -1201,11 +1204,11 @@ nixlAgent::releaseXferReq(nixlXferReqH *req_hndl) const {
 
     NIXL_SHARED_LOCK_GUARD(data->lock);
     //attempt to cancel request
-    if(req_hndl->status == NIXL_IN_PROG) {
+    if(req_hndl->status == NIXL_IN_PROG || req_hndl->status == NIXL_SENT) {
         req_hndl->status = req_hndl->engine->checkXfer(
                                      req_hndl->backendHandle);
 
-        if(req_hndl->status == NIXL_IN_PROG) {
+        if(req_hndl->status == NIXL_IN_PROG || req_hndl->status == NIXL_SENT) {
 
             req_hndl->status = req_hndl->engine->releaseReqH(
                                          req_hndl->backendHandle);

@@ -95,6 +95,8 @@ throw_nixl_exception(const nixl_status_t &status) {
     switch (status) {
     case NIXL_IN_PROG:
         return; // not an error
+    case NIXL_SENT:
+        return; // not an error
     case NIXL_SUCCESS:
         return; // not an error
     case NIXL_ERR_NOT_POSTED:
@@ -173,6 +175,7 @@ PYBIND11_MODULE(_bindings, m) {
         .export_values();
 
     py::enum_<nixl_status_t>(m, "nixl_status_t")
+        .value("NIXL_SENT", NIXL_SENT)
         .value("NIXL_IN_PROG", NIXL_IN_PROG)
         .value("NIXL_SUCCESS", NIXL_SUCCESS)
         .value("NIXL_ERR_NOT_POSTED", NIXL_ERR_NOT_POSTED)

@@ -601,6 +601,8 @@ class nixl_agent:
         status = self.agent.postXferReq(handle._handle, notif_msg)
         if status == nixlBind.NIXL_SUCCESS:
             return "DONE"
+        elif status == nixlBind.NIXL_SENT:
+            return "SENT"
         elif status == nixlBind.NIXL_IN_PROG:
             return "PROC"
         else:
@@ -617,6 +619,8 @@ class nixl_agent:
         status = self.agent.getXferStatus(handle._handle)
         if status == nixlBind.NIXL_SUCCESS:
             return "DONE"
+        elif status == nixlBind.NIXL_SENT:
+            return "SENT"
         elif status == nixlBind.NIXL_IN_PROG:
             return "PROC"
         else:

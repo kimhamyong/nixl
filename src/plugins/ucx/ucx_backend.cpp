@@ -48,6 +48,8 @@ class nixlUcxBackendH : public nixlBackendReqH {
 private:
     std::set<ucx_connection_ptr_t> connections_;
     std::vector<nixlUcxReq> requests_;
+    std::vector<nixlUcxReq> flush_requests_;
+    bool data_sent_ = false;  // true when all data requests completed
     nixlUcxWorker *worker;
     size_t worker_id;
 
@@ -87,6 +89,7 @@ public:
     void
     reserve(size_t size) {
         requests_.reserve(size);
+        flush_requests_.reserve(size);
         NIXL_ASSERT(connections_.empty());
     }
 
@@ -102,6 +105,23 @@ public:
             break;
         default:
             // Error. Release all previously initiated ops and exit:
+            release();
+            return status;
+        }
+        return NIXL_SUCCESS;
+    }
+
+    nixl_status_t
+    appendFlush(nixl_status_t status, nixlUcxReq req, ucx_connection_ptr_t conn) {
+        switch (status) {
+        case NIXL_IN_PROG:
+            flush_requests_.push_back(req);
+            connections_.insert(conn);
+            break;
+        case NIXL_SUCCESS:
+            connections_.insert(conn);
+            break;
+        default:
             release();
             return status;
         }
@@ -124,63 +144,102 @@ public:
         for (nixlUcxReq req : requests_) {
             nixl_status_t ret = ucx_status_to_nixl(ucp_request_check_status(req));
             if (ret == NIXL_IN_PROG) {
-                // TODO: Need process this properly.
-                // it may not be enough to cancel UCX request
+                worker->reqCancel(req);
+            }
+            worker->reqRelease(req);
+        }
+        for (nixlUcxReq req : flush_requests_) {
+            nixl_status_t ret = ucx_status_to_nixl(ucp_request_check_status(req));
+            if (ret == NIXL_IN_PROG) {
                 worker->reqCancel(req);
             }
             worker->reqRelease(req);
         }
         requests_.clear();
+        flush_requests_.clear();
+        data_sent_ = false;
         connections_.clear();
         return NIXL_SUCCESS;
     }
 
     virtual nixl_status_t
     status() {
-        if (requests_.empty()) {
-            /* No pending transmissions */
-            connections_.clear();
-            return NIXL_SUCCESS;
-        }
-
         /* Maximum progress */
         while (worker->progress())
             ;
 
-        /* If last request is incomplete, return NIXL_IN_PROG early without
-         * checking other requests */
-        nixlUcxReq req = requests_.back();
-        nixl_status_t ret = ucx_status_to_nixl(ucp_request_check_status(req));
-        if (ret == NIXL_IN_PROG) {
-            return NIXL_IN_PROG;
-        } else if (ret != NIXL_SUCCESS) {
-            return checkConnection(ret);
+        /* Phase 1: Check data requests (ucp_put_nbx / ucp_get_nbx) */
+        if (!data_sent_ && !requests_.empty()) {
+            nixlUcxReq req = requests_.back();
+            nixl_status_t ret = ucx_status_to_nixl(ucp_request_check_status(req));
+            if (ret == NIXL_IN_PROG) {
+                return NIXL_IN_PROG;
+            } else if (ret != NIXL_SUCCESS) {
+                return checkConnection(ret);
+            }
+
+            size_t incomplete_reqs = 0;
+            nixl_status_t out_ret = NIXL_SUCCESS;
+            for (nixlUcxReq req : requests_) {
+                nixl_status_t ret = ucx_status_to_nixl(ucp_request_check_status(req));
+                if (__builtin_expect(ret == NIXL_SUCCESS, 0)) {
+                    worker->reqRelease(req);
+                } else if (ret == NIXL_IN_PROG) {
+                    if (out_ret == NIXL_SUCCESS) {
+                        out_ret = NIXL_IN_PROG;
+                    }
+                    requests_[incomplete_reqs++] = req;
+                } else {
+                    out_ret = checkConnection(ret);
+                }
+            }
+
+            requests_.resize(incomplete_reqs);
+            if (out_ret == NIXL_IN_PROG) {
+                return NIXL_IN_PROG;
+            }
+            if (out_ret != NIXL_SUCCESS) {
+                return out_ret;
+            }
+            /* All data requests completed */
+            data_sent_ = true;
         }
 
-        /* Last request completed successfully, all the others must be in the
-         * same state. TODO: remove extra checks? */
-        size_t incomplete_reqs = 0;
-        nixl_status_t out_ret = NIXL_SUCCESS;
-        for (nixlUcxReq req : requests_) {
-            nixl_status_t ret = ucx_status_to_nixl(ucp_request_check_status(req));
-            if (__builtin_expect(ret == NIXL_SUCCESS, 0)) {
-                worker->reqRelease(req);
-            } else if (ret == NIXL_IN_PROG) {
-                if (out_ret == NIXL_SUCCESS) {
-                    out_ret = NIXL_IN_PROG;
+        /* Phase 2: Check flush requests (ucp_ep_flush_nbx) */
+        if (!flush_requests_.empty()) {
+            size_t incomplete_reqs = 0;
+            nixl_status_t out_ret = NIXL_SUCCESS;
+            for (nixlUcxReq req : flush_requests_) {
+                nixl_status_t ret = ucx_status_to_nixl(ucp_request_check_status(req));
+                if (ret == NIXL_SUCCESS) {
+                    worker->reqRelease(req);
+                } else if (ret == NIXL_IN_PROG) {
+                    if (out_ret == NIXL_SUCCESS) {
+                        out_ret = NIXL_IN_PROG;
+                    }
+                    flush_requests_[incomplete_reqs++] = req;
+                } else {
+                    out_ret = checkConnection(ret);
                 }
-                requests_[incomplete_reqs++] = req;
-            } else {
-                // Any other ret value is ERR and will be returned
-                out_ret = checkConnection(ret);
+            }
+            flush_requests_.resize(incomplete_reqs);
+
+            if (out_ret == NIXL_IN_PROG) {
+                /* Data sent, flush still pending → NIXL_SENT */
+                return NIXL_SENT;
+            }
+            if (out_ret != NIXL_SUCCESS) {
+                return out_ret;
             }
         }
 
-        requests_.resize(incomplete_reqs);
-        if (requests_.empty()) {
+        /* All requests (data + flush) completed */
+        if (requests_.empty() && flush_requests_.empty()) {
             connections_.clear();
+            return NIXL_SUCCESS;
         }
-        return out_ret;
+
+        return data_sent_ ? NIXL_SENT : NIXL_IN_PROG;
     }
 
     void
@@ -626,7 +685,7 @@ protected:
 
             for (auto it = requests_.begin(); it != requests_.end();) {
                 nixl_status_t status = (*it)->status();
-                if (status != NIXL_IN_PROG) {
+                if (status != NIXL_IN_PROG && status != NIXL_SENT) {
                     NIXL_TRACE << "dedicated " << *this << " completing " << *(*it)
                                << " with status: " << status;
                     (*it)->complete(status);
@@ -1269,7 +1328,7 @@ nixlUcxEngine::sendXferRange(const nixl_xfer_op_t &operation,
     for (auto &conn : intHandle->getConnections()) {
         nixlUcxReq req;
         ret = conn->getEp(workerId)->flushEp(req);
-        if (intHandle->append(ret, req, conn) != NIXL_SUCCESS) {
+        if (intHandle->appendFlush(ret, req, conn) != NIXL_SUCCESS) {
             return ret;
         }
     }
@@ -1316,7 +1375,7 @@ nixlUcxEngine::postXfer(const nixl_xfer_op_t &operation,
             }
 
             ret = int_handle->status();
-        } else if (ret == NIXL_IN_PROG) {
+        } else if (ret == NIXL_IN_PROG || ret == NIXL_SENT) {
             int_handle->notification().emplace(remote_agent, opt_args->notifMsg);
         }
     }
@@ -1331,7 +1390,8 @@ nixl_status_t nixlUcxEngine::checkXfer (nixlBackendReqH* handle) const
     nixl_status_t handle_status = intHandle->status();
 
     if ((handle_status != NIXL_SUCCESS) || !notif.has_value()) {
-        if (handle_status != NIXL_IN_PROG) { // error flow
+        if (handle_status != NIXL_IN_PROG && handle_status != NIXL_SENT) {
+            // error flow: reset notification
             notif.reset();
         }
 
